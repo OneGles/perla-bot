@@ -5,140 +5,161 @@ from zoneinfo import ZoneInfo
 from discord import AllowedMentions
 import random
 import os
-import logging
+from discord import ChannelType
+import asyncio
+import aiohttp
+import io
 
-TOKEN = os.getenv("TOKEN")  # token bot ds
-SOURCE_CHANNEL_ID = int(os.getenv("SOURCE_CHANNEL_ID"))  # canale perle
-TARGET_CHANNEL_ID = int(os.getenv("TARGET_CHANNEL_ID"))  # canale dove scrive il bot
-ROLE_ID = int(os.getenv("ROLE_ID"))  # ruolo dei membri da taggare
-MAX_UPLOAD_SIZE = 8 * 1024 * 1024  # 8 MB di limite per colpa di ds
-cached_messages = []  # salvataggio messaggi senza leggerli ogni volta
+VALID_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp3", ".wav", ".mp4", ".mov", ".m4a")
+
+def require_int_env(name: str) -> int:
+    v = os.getenv(name)
+    if not v:
+        raise RuntimeError(f"Missing env var: {name}")
+    return int(v)
+
+TOKEN = os.getenv("TOKEN")
+if not TOKEN:
+    raise RuntimeError("Missing env var: TOKEN")
+
+SOURCE_CHANNEL_ID = require_int_env("SOURCE_CHANNEL_ID")
+TARGET_CHANNEL_ID = require_int_env("TARGET_CHANNEL_ID")
+ROLE_ID = require_int_env("ROLE_ID")
+
+MAX_UPLOAD_SIZE = 8 * 1024 * 1024
+cached_messages = []
 
 # timezone for scheduled tasks (IANA name, e.g. 'UTC' or 'Europe/Rome')
 TIMEZONE = os.getenv("TIMEZONE", "UTC")
 TZ = ZoneInfo(TIMEZONE)
 
 intents = discord.Intents.default()
+intents.guilds = True
 intents.message_content = True
 
-# creazione client
 client = discord.Client(intents=intents)
-logger = logging.getLogger(__name__)
-
-# ensure this module's logger emits INFO messages (add handler if needed)
-handler = logging.StreamHandler()
-handler.setLevel(logging.INFO)
-formatter = logging.Formatter("%(asctime)s %(levelname)s:%(name)s: %(message)s")
-handler.setFormatter(formatter)
-if not logger.handlers:
-    logger.addHandler(handler)
-logger.setLevel(logging.INFO)
-
 
 # carica tutte le perle in array
 async def load_messages():
+    """
+    Carica tutti i messaggi dal canale SOURCE_CHANNEL_ID,
+    compresi testo e attachment.
+    """
     global cached_messages
 
-    logger.info("Loading messages from source channel...")
-
     source_channel = client.get_channel(SOURCE_CHANNEL_ID)
+    if source_channel is None:
+        source_channel = await client.fetch_channel(SOURCE_CHANNEL_ID)
+
+    if source_channel.type != ChannelType.text:
+        raise RuntimeError("Source channel non è un canale testuale!")
+
     cached_messages = []
+    total_fetched = 0
 
-    async for msg in source_channel.history(limit=None):
-        if msg.author.bot:
-            continue
+    print("Inizio caricamento messaggi dal canale…")
 
-        # Carica Testo e url del mex originale
+    async for msg in source_channel.history(limit=None, oldest_first=True):
+        total_fetched += 1
+
         if msg.content.strip():
-            cached_messages.append(
-                {
-                    "type": "text",
-                    "content": msg.content,
-                    "attachments": [],
-                    "jump_url": msg.jump_url,
-                }
-            )
+            cached_messages.append({
+                "type": "text",
+                "content": msg.content,
+                "attachments": [],
+                "jump_url": msg.jump_url
+            })
 
-        # Carica url e file del canale target
         if msg.attachments:
-            cached_messages.append(
+            valid_attachments = [
                 {
+                    "url": a.url,
+                    "size": a.size,
+                    "filename": a.filename
+                }
+                for a in msg.attachments
+                if a.filename.lower().endswith(VALID_EXTS)
+            ]
+
+            if valid_attachments:
+                cached_messages.append({
                     "type": "attachment",
                     "jump_url": msg.jump_url,
-                    "attachments": [
-                        {"url": a.url, "size": a.size, "filename": a.filename}
-                        for a in msg.attachments
-                    ],
-                }
-            )
+                    "attachments": valid_attachments
+                })
 
-    logger.info("Loaded %d items", len(cached_messages))
+        if total_fetched % 100 == 0:
+            print(f"Messaggi processati finora: {total_fetched}")
+            await asyncio.sleep(0.5)
 
+    print(f"Caricamento completato. Totale messaggi validi: {len(cached_messages)}")
 
-@tasks.loop(time=time(hour=21, minute=0, second=0, tzinfo=TZ))
+# invio messaggio
+@tasks.loop(time=time(hour=21, minute=31, second=0, tzinfo=TZ))
 async def daily_post():
-    logger.info("Posting daily message...")
     if not cached_messages:
-        logger.info("No messages cached")
+        print("No messages cached")
         return
 
-    # index random compreso negli elementi dell'array, poi pop
     index = random.randrange(len(cached_messages))
     item = cached_messages.pop(index)
 
-    # item = random.choice(cached_messages)
-
-    # collegamento al canale target, tag del ruolo e link al mex originale
     target_channel = client.get_channel(TARGET_CHANNEL_ID)
+    if target_channel is None:
+        target_channel = await client.fetch_channel(TARGET_CHANNEL_ID)
+
     role_mention = f"<@&{ROLE_ID}>"
     source_link = f"\n\nMessaggio originale:\n{item['jump_url']}"
 
-    # se è una stringa condividi il content e tagga
     if item["type"] == "text":
         await target_channel.send(
             content=f"{role_mention}\n{item['content']}{source_link}",
-            allowed_mentions=AllowedMentions(roles=True),
+            allowed_mentions=AllowedMentions(roles=True)
         )
 
-    # se è un file non stringa carica il file e tagga, se il file è troppo grande invia url
     elif item["type"] == "attachment":
         attachments = item["attachments"]
-
         total_size = sum(a["size"] for a in attachments)
 
-        # caso 1: upload possibile
+        # upload possibile
         if total_size <= MAX_UPLOAD_SIZE:
             files = []
-            for a in attachments:
-                file = await discord.File.from_url(a["url"], filename=a["filename"])
-                files.append(file)
+
+            async with aiohttp.ClientSession() as session:
+                for a in attachments:
+                    async with session.get(a["url"]) as resp:
+                        if resp.status != 200:
+                            print(f"Errore download {a['url']}")
+                            continue
+
+                        data = await resp.read()
+                        files.append(
+                            discord.File(
+                                io.BytesIO(data),
+                                filename=a["filename"]
+                            )
+                        )
 
             await target_channel.send(
-                content=f"{role_mention}{source_link}",
                 files=files,
-                allowed_mentions=AllowedMentions(roles=True),
+                content=f"{role_mention}{source_link}",
+                allowed_mentions=AllowedMentions(roles=True)
             )
 
-        # caso 2: troppo grandi → URL
+        # troppo grandi → URL
         else:
             urls = "\n".join(a["url"] for a in attachments)
             await target_channel.send(
                 content=f"{role_mention}\n{urls}{source_link}",
-                allowed_mentions=AllowedMentions(roles=True),
+                allowed_mentions=AllowedMentions(roles=True)
             )
 
-    logger.info("Posted daily message")
+    print("Posted daily message")
 
-
-# viene chiamato una volta sola quando il bot è online
 @client.event
 async def on_ready():
-    logger.info("Logged in as %s", client.user)
-
+    print(f"Logged in as {client.user}")
     await load_messages()
-    # start short-running test loop and the daily poster
     daily_post.start()
 
-
-# avvio bot
 client.run(TOKEN)
