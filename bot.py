@@ -39,7 +39,7 @@ intents.message_content = True
 
 client = discord.Client(intents=intents)
 
-# carica tutte le perle in array
+# carica tutti i messaggi in array
 async def load_messages():
     """
     Carica tutti i messaggi dal canale SOURCE_CHANNEL_ID,
@@ -163,3 +163,4 @@ async def on_ready():
     daily_post.start()
 
 client.run(TOKEN)
+
