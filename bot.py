@@ -76,6 +76,7 @@ async def load_messages():
             continue
 
         cached_messages.append({
+            "message_id": msg.id,                # <-- aggiunto
             "content": msg.content.strip(),
             "attachments": valid_attachments,
             "jump_url": msg.jump_url
@@ -91,6 +92,7 @@ async def load_messages():
 # DAILY POST
 # =========================
 @tasks.loop(time=time(hour=21, minute=31, second=0, tzinfo=TZ))
+#@tasks.loop(seconds=1.2)
 async def daily_post():
     if not cached_messages:
         print("No messages cached")
@@ -106,30 +108,57 @@ async def daily_post():
     role_mention = f"<@&{ROLE_ID}>"
     source_link = f"\n\nMessaggio originale:\n{item['jump_url']}"
 
+    # refetch del messaggio originale per avere URL allegati aggiornati
+    source_channel = client.get_channel(SOURCE_CHANNEL_ID)
+    if source_channel is None:
+        source_channel = await client.fetch_channel(SOURCE_CHANNEL_ID)
+
+    fresh_attachments = item["attachments"]
+    try:
+        orig_msg = await source_channel.fetch_message(item["message_id"])
+        fresh_attachments = [
+            {"url": a.url, "size": a.size, "filename": a.filename}
+            for a in orig_msg.attachments
+            if a.filename.lower().endswith(VALID_EXTS)
+        ]
+    except Exception as e:
+        print(f"fetch_message fallito per {item['message_id']}: {e}")
+
     files = []
-    total_size = sum(a["size"] for a in item["attachments"])
+    urls_fallback = []
+
+    total_size = sum(a["size"] for a in fresh_attachments)
 
     # scarica allegati se presenti e uploadabili
-    if item["attachments"] and total_size <= MAX_UPLOAD_SIZE:
-        async with aiohttp.ClientSession() as session:
-            for a in item["attachments"]:
-                async with session.get(a["url"]) as resp:
-                    if resp.status != 200:
-                        print(f"Errore download {a['url']}")
-                        continue
+    if fresh_attachments and total_size <= MAX_UPLOAD_SIZE:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for a in fresh_attachments:
+                try:
+                    async with session.get(a["url"]) as resp:
+                        if resp.status != 200:
+                            urls_fallback.append(a["url"])
+                            continue
 
-                    data = await resp.read()
-                    files.append(
-                        discord.File(
-                            io.BytesIO(data),
-                            filename=a["filename"]
+                        data = await resp.read()
+                        files.append(
+                            discord.File(
+                                io.BytesIO(data),
+                                filename=a["filename"]
+                            )
                         )
-                    )
+                except Exception:
+                    urls_fallback.append(a["url"])
+    else:
+        # troppo grandi → URL
+        urls_fallback = [a["url"] for a in fresh_attachments]
 
-    # costruzione contenuto
+    # costruzione contenuto (se download fallisce, includo URL per embed)
     content = f"{role_mention}"
     if item["content"]:
         content += f"\n{item['content']}"
+    if urls_fallback and not files:
+        content += "\n" + "\n".join(urls_fallback)
     content += source_link
 
     # invio
@@ -154,4 +183,3 @@ async def on_ready():
     daily_post.start()
 
 client.run(TOKEN)
-
