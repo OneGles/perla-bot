@@ -91,7 +91,7 @@ async def load_messages():
 # =========================
 # DAILY POST
 # =========================
-@tasks.loop(time=time(hour=21, minute=31, second=0, tzinfo=TZ))
+@tasks.loop(time=time(hour=1, minute=31, second=0, tzinfo=TZ))
 #@tasks.loop(seconds=1.2)
 async def daily_post():
     if not cached_messages:
@@ -105,76 +105,67 @@ async def daily_post():
     if target_channel is None:
         target_channel = await client.fetch_channel(TARGET_CHANNEL_ID)
 
-    role_mention = f"<@&{ROLE_ID}>"
-    source_link = f"\n\nMessaggio originale:\n{item['jump_url']}"
-
-    # refetch del messaggio originale per avere URL allegati aggiornati
+    # 1. Recupero FORZATO del messaggio aggiornato per avere URL validi
     source_channel = client.get_channel(SOURCE_CHANNEL_ID)
     if source_channel is None:
         source_channel = await client.fetch_channel(SOURCE_CHANNEL_ID)
 
-    fresh_attachments = item["attachments"]
+    files = []
+    urls_fallback = []
+    
     try:
+        # Questo genera nuovi URL temporanei validi per i prossimi min/ore
         orig_msg = await source_channel.fetch_message(item["message_id"])
         fresh_attachments = [
-            {"url": a.url, "size": a.size, "filename": a.filename}
-            for a in orig_msg.attachments
+            a for a in orig_msg.attachments 
             if a.filename.lower().endswith(VALID_EXTS)
         ]
     except Exception as e:
-        print(f"fetch_message fallito per {item['message_id']}: {e}")
+        print(f"Errore critico: Messaggio originale {item['message_id']} non trovato: {e}")
+        return
 
-    files = []
-    urls_fallback = []
-
-    total_size = sum(a["size"] for a in fresh_attachments)
-
-    # scarica allegati se presenti e uploadabili
-    if fresh_attachments and total_size <= MAX_UPLOAD_SIZE:
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+    # 2. Download degli allegati con gestione sessione migliorata
+    if fresh_attachments:
+        async with aiohttp.ClientSession() as session:
             for a in fresh_attachments:
-                try:
-                    async with session.get(a["url"]) as resp:
-                        if resp.status != 200:
-                            urls_fallback.append(a["url"])
-                            continue
+                if a.size <= MAX_UPLOAD_SIZE:
+                    try:
+                        async with session.get(a.url) as resp:
+                            if resp.status == 200:
+                                data = await resp.read()
+                                files.append(discord.File(io.BytesIO(data), filename=a.filename))
+                            else:
+                                urls_fallback.append(a.url)
+                    except Exception as e:
+                        print(f"Errore download {a.filename}: {e}")
+                        urls_fallback.append(a.url)
+                else:
+                    urls_fallback.append(a.url)
 
-                        data = await resp.read()
-                        files.append(
-                            discord.File(
-                                io.BytesIO(data),
-                                filename=a["filename"]
-                            )
-                        )
-                except Exception:
-                    urls_fallback.append(a["url"])
-    else:
-        # troppo grandi → URL
-        urls_fallback = [a["url"] for a in fresh_attachments]
+    # 3. Costruzione del messaggio finale
+    role_mention = f"<@&{ROLE_ID}>"
+    source_link = f"\n\n**Messaggio originale:**\n{item['jump_url']}"
+    
+    # Uniamo il contenuto testuale originale
+    main_content = f"{role_mention}\n{item['content']}" if item['content'] else role_mention
+    
+    # Se ci sono URL che non siamo riusciti a scaricare, li aggiungiamo come testo
+    if urls_fallback:
+        fallback_text = "\n" + "\n".join(urls_fallback)
+        main_content += fallback_text
+    
+    full_message = f"{main_content}{source_link}"
 
-    # costruzione contenuto (se download fallisce, includo URL per embed)
-    content = f"{role_mention}"
-    if item["content"]:
-        content += f"\n{item['content']}"
-    if urls_fallback and not files:
-        content += "\n" + "\n".join(urls_fallback)
-    content += source_link
-
-    # invio
-    if files:
+    # 4. Invio
+    try:
         await target_channel.send(
-            content=content,
-            files=files,
+            content=full_message,
+            files=files if files else None,
             allowed_mentions=AllowedMentions(roles=True)
         )
-    else:
-        await target_channel.send(
-            content=content,
-            allowed_mentions=AllowedMentions(roles=True)
-        )
-
-    print("Posted daily message")
+        print(f"Messaggio inviato correttamente (ID: {item['message_id']})")
+    except Exception as e:
+        print(f"Errore durante l'invio nel canale target: {e}")
 
 @client.event
 async def on_ready():
